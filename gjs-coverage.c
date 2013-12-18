@@ -266,6 +266,43 @@ lookup_or_create_statistics (GHashTable *table,
   return statistics;
 }
 
+static gboolean
+strv_element_contained_in_string (const gchar *haystack,
+                                  const gchar **strv,
+                                  guint       haystack_length)
+{
+  size_t iterator = 0;
+  for (; iterator < haystack_length; ++iterator)
+    {
+      if (strstr (haystack, strv[iterator]))
+        {
+          return TRUE;
+        }
+    }
+
+  return FALSE;
+}
+
+static gboolean
+str_contained_in_env(const gchar *haystack,
+                     const gchar *key)
+{
+  const gchar *value = g_getenv (key);
+  gchar **value_tokens = g_strsplit(value, ":", -1);
+  gboolean return_value = strv_element_contained_in_string (haystack,
+                                                            (const gchar **) value_tokens,
+                                                            g_strv_length (value_tokens));
+
+  g_free (value_tokens);
+  return return_value;
+}
+
+typedef struct _GjsCoverageData
+{
+  const gchar **exclude_paths;
+  GHashTable  *statistics;
+} GjsCoverageData;
+
 static void
 new_script_hook (JSContext *context,
                  const char *filename,
@@ -274,24 +311,18 @@ new_script_hook (JSContext *context,
                  JSFunction *function,
                  void *caller_data)
 {
-  static const gchar *ignore_patterns[] =
-  {
-    /* Ignore /share/gjs-1.0 as this is where we keep things like
-     * overrids and lang, and we don't care about code coverage there */
-    "/share/gjs-1.0/"
-  };
-
   disable_interrupts_for_script (context, script);
 
-  const size_t ignore_patterns_length = sizeof (ignore_patterns) / sizeof (ignore_patterns[0]);
-  size_t ignore_patterns_iterator = 0;
-  for (; ignore_patterns_iterator < ignore_patterns_length; ++ignore_patterns_iterator)
-    {
-      if (strstr (filename, ignore_patterns[ignore_patterns_iterator]))
-        {
-          return;
-        }
-    }
+  GjsCoverageData *coverage_data = (GjsCoverageData *) caller_data;
+
+  /* We don't want coverage data on installed scripts */
+  if (str_contained_in_env (filename, "XDG_DATA_DIRS"))
+    return;
+  if (coverage_data->exclude_paths &&
+      strv_element_contained_in_string (filename,
+                                        coverage_data->exclude_paths,
+                                        g_strv_length ((gchar **) coverage_data->exclude_paths)))
+    return;
 
   /* Count the number of lines in the file */
   GFile *file = g_file_new_for_path (filename);
@@ -319,10 +350,10 @@ new_script_hook (JSContext *context,
   g_assert (bytes_read == data_count);
 
   /* Add information about any executable lines to this script */
-  GArray *statistics = lookup_or_create_statistics (caller_data, filename, data);
+  GArray *statistics = lookup_or_create_statistics (coverage_data->statistics, filename, data);
   determine_executable_lines (context, script, lineno, statistics, data);
 
-  enable_interrupts_for_script (context, script, interrupt_hook, caller_data);
+  enable_interrupts_for_script (context, script, interrupt_hook, coverage_data->statistics);
 
   g_object_unref (stream);
   g_object_unref (file);
@@ -346,21 +377,15 @@ void print_statistics_for_files (gpointer key,
   g_file_create (tracefile, G_FILE_CREATE_REPLACE_DESTINATION, NULL, NULL);
   GFileIOStream *iostream = g_file_open_readwrite (tracefile, NULL, NULL);
   GOutputStream *ostream = g_io_stream_get_output_stream ((GIOStream *) iostream);
-  gchar *current_directory = g_get_current_dir();
-  gchar *absolute_path_to_source_file = g_strconcat (current_directory, "/", (const gchar *) key, NULL);
-  
-  g_free (current_directory);
 
   write_to_stream (ostream, "SF:");
-  write_to_stream (ostream, absolute_path_to_source_file);
+  write_to_stream (ostream, (const gchar *) key);
   write_to_stream (ostream, "\n");
   write_to_stream (ostream, "FNF:0\n");
   write_to_stream (ostream, "FNH:0\n");
   write_to_stream (ostream, "BRF:0\n");
   write_to_stream (ostream, "BRH:0\n");
-  
-  g_free (absolute_path_to_source_file);
-  
+
   GArray *stats = value;
 
   guint i = 0;
@@ -403,19 +428,69 @@ int main (int argc, char **argv)
       return 1;
     }
 
+  static gchar **include_path = NULL;
+  static gchar **exclude_from_coverage_path = NULL;
+  static gchar *js_version = NULL;
+
+  static GOptionEntry entries[] = {
+      { "include-path", 'I', 0, G_OPTION_ARG_STRING_ARRAY, &include_path, "Add the directory DIR to the list of directories to search for js files.", "DIR" },
+      { "js-version", 0, 0, G_OPTION_ARG_STRING, &js_version, "JavaScript version (e.g. \"default\", \"1.8\"", "JSVERSION" },
+      { "exlcude-from-coverage", 'E', 0, G_OPTION_ARG_STRING_ARRAY, &exclude_from_coverage_path, "Exclude the directory DIR from the directories containing files where coverage reports will be generated." "DIR" },
+      { NULL }
+  };
+
+  GOptionContext *option_context = g_option_context_new (NULL);
+  GError *error = NULL;
+
+  g_option_context_set_ignore_unknown_options (option_context, TRUE);
+  g_option_context_add_main_entries (option_context, entries, NULL);
+  if (!g_option_context_parse(option_context, &argc, &argv, &error))
+    {
+      g_error("failed to parse options: %s", error->message);
+      return 1;
+    }
+
+  g_option_context_free (option_context);
+
   GHashTable *statistics =
     g_hash_table_new_full (g_str_hash,
                            g_str_equal,
                            g_free,
                            (GDestroyNotify) g_array_unref);
 
-  GjsContext *context = gjs_context_new ();
+  const gchar *js_version_to_pass = NULL;
+
+  if (js_version)
+    js_version_to_pass = gjs_context_scan_buffer_for_js_version(js_version, 1024);
+
+  GjsContext *context = NULL;
+
+  if (js_version_to_pass)
+    {
+      context = g_object_new(GJS_TYPE_CONTEXT,
+                             "search-path", include_path,
+                             "js-version", js_version_to_pass,
+                             NULL);
+    }
+  else
+    {
+      context = g_object_new(GJS_TYPE_CONTEXT,
+                             "search-path", include_path,
+                             NULL);
+    }
+
+  GjsCoverageData coverage_data =
+  {
+    (const gchar **) exclude_from_coverage_path,
+    statistics
+  };
+
   JSContext *js_context = gjs_context_get_native_context (context);
   JSRuntime *js_runtime = JS_GetRuntime (js_context);
   JS_BeginRequest (js_context);
   JS_SetOptions (js_context, JSOPTION_METHODJIT);
   JS_SetDebugMode (js_context, TRUE);
-  JS_SetNewScriptHookProc (js_runtime, new_script_hook, statistics);
+  JS_SetNewScriptHookProc (js_runtime, new_script_hook, &coverage_data);
   JS_EndRequest (js_context);
 
   if (!gjs_context_define_string_array (context,
@@ -424,14 +499,14 @@ int main (int argc, char **argv)
                                         (const char **) argv + 2,
                                         NULL))
     {
-      g_print ("Failed to define ARGV");
+      g_print ("Failed to define AR  GError *GV");
       g_object_unref (context);
       g_hash_table_unref (statistics);
       return 1;
     }
 
   int status;
-  GError *error = NULL;
+  error = NULL;
   if (!gjs_context_eval_file (context, argv[1], &status, &error))
     {
       g_printerr ("Error in evaluating js : %s\n", error->message);
@@ -441,6 +516,15 @@ int main (int argc, char **argv)
 
   g_hash_table_unref (statistics);
   g_object_unref (context);
+
+  if (include_path)
+    g_strfreev(include_path);
+
+  if (exclude_from_coverage_path)
+    g_strfreev(exclude_from_coverage_path);
+
+  if (js_version)
+    g_free(js_version);
 
   return 0;
 }
