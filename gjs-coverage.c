@@ -293,7 +293,7 @@ str_contained_in_env(const gchar *haystack,
                                                             (const gchar **) value_tokens,
                                                             g_strv_length (value_tokens));
 
-  g_free (value_tokens);
+  g_strfreev (value_tokens);
   return return_value;
 }
 
@@ -365,18 +365,69 @@ void write_to_stream (GOutputStream *ostream,
   g_output_stream_write (ostream, msg, strlen (msg), NULL, NULL);
 }
 
+typedef struct _GjsCoverageTracefile
+{
+  const gchar *potential_path;
+  GFile       *open_handle;
+} GjsCoverageTracefile;
+
+GFile *
+delete_file_at_path_and_open_anew (const gchar *path)
+{
+  GFile *file = g_file_new_for_path (path);
+  g_file_delete (file, NULL, NULL);
+  g_file_create (file, G_FILE_CREATE_REPLACE_DESTINATION, NULL, NULL);
+  return file;
+}
+
+GFile *
+create_tracefile_for_script_name (const gchar *script_name)
+{
+  gsize tracefile_name_buffer_size = strlen ((const gchar *) script_name) + 8;
+  gchar tracefile_name_buffer[tracefile_name_buffer_size];
+  snprintf (tracefile_name_buffer, tracefile_name_buffer_size, "%s.info", (const gchar *) script_name);
+  g_print("created tracefile %s\n", tracefile_name_buffer);
+
+  return delete_file_at_path_and_open_anew (tracefile_name_buffer);
+}
+
+GFile *
+open_tracefile (GjsCoverageTracefile *tracefile_info,
+                const gchar          *script_name)
+{
+  if (tracefile_info->open_handle)
+    return g_object_ref (tracefile_info->open_handle);
+  if (tracefile_info->potential_path)
+    {
+      tracefile_info->open_handle = delete_file_at_path_and_open_anew (tracefile_info->potential_path);
+      /* Create an extra reference on this file so that we don't have
+       * to constantly open and close it */
+      g_object_ref (tracefile_info->open_handle);
+      return tracefile_info->open_handle;
+    }
+
+  return create_tracefile_for_script_name (script_name);
+}
+
+GFileIOStream *
+get_io_stream_at_end_position_for_tracefile (GFile *file)
+{
+  GFileIOStream *iostream = g_file_open_readwrite (file, NULL, NULL);
+  GError *error = NULL;
+
+  if (!g_seekable_seek (G_SEEKABLE (iostream), 0, SEEK_END, NULL, &error))
+    g_error ("Error occurred in seeking output stream: %s", error->message);
+
+  return iostream;
+}
+
 void print_statistics_for_files (gpointer key,
                                  gpointer value,
                                  gpointer user_data)
 {
-  gsize tracefile_name_buffer_size = strlen ((const gchar *) key) + 8;
-  gchar tracefile_name_buffer[tracefile_name_buffer_size];
-  snprintf (tracefile_name_buffer, tracefile_name_buffer_size, "%s.info", (const gchar *) key);
-  GFile *tracefile = g_file_new_for_path (tracefile_name_buffer);
-  g_file_delete (tracefile, NULL, NULL);
-  g_file_create (tracefile, G_FILE_CREATE_REPLACE_DESTINATION, NULL, NULL);
-  GFileIOStream *iostream = g_file_open_readwrite (tracefile, NULL, NULL);
-  GOutputStream *ostream = g_io_stream_get_output_stream ((GIOStream *) iostream);
+  GFile *tracefile = open_tracefile ((GjsCoverageTracefile *) user_data, (const gchar *) key);
+  GFileIOStream *iostream = get_io_stream_at_end_position_for_tracefile (tracefile);
+  GOutputStream *ostream = g_io_stream_get_output_stream (G_IO_STREAM (iostream));
 
   write_to_stream (ostream, "SF:");
   write_to_stream (ostream, (const gchar *) key);
@@ -418,6 +469,9 @@ void print_statistics_for_files (gpointer key,
   snprintf (lines_hit_buffer, 64, "%i\n", executable_lines_count);
   write_to_stream (ostream, lines_hit_buffer);
   write_to_stream (ostream, "end_of_record\n");
+
+  g_object_unref (iostream);
+  g_object_unref (tracefile);
 }
 
 int main (int argc, char **argv)
@@ -431,11 +485,13 @@ int main (int argc, char **argv)
   static gchar **include_path = NULL;
   static gchar **exclude_from_coverage_path = NULL;
   static gchar *js_version = NULL;
+  static gchar *tracefile_output_path = NULL;
 
   static GOptionEntry entries[] = {
       { "include-path", 'I', 0, G_OPTION_ARG_STRING_ARRAY, &include_path, "Add the directory DIR to the list of directories to search for js files.", "DIR" },
       { "js-version", 0, 0, G_OPTION_ARG_STRING, &js_version, "JavaScript version (e.g. \"default\", \"1.8\"", "JSVERSION" },
       { "exlcude-from-coverage", 'E', 0, G_OPTION_ARG_STRING_ARRAY, &exclude_from_coverage_path, "Exclude the directory DIR from the directories containing files where coverage reports will be generated." "DIR" },
+      { "tracefile-output", 'o', 0, G_OPTION_ARG_STRING, &tracefile_output_path, "Write all trace data to a single file FILE.", "FILE" },
       { NULL }
   };
 
@@ -499,7 +555,7 @@ int main (int argc, char **argv)
                                         (const char **) argv + 2,
                                         NULL))
     {
-      g_print ("Failed to define AR  GError *GV");
+      g_print ("Failed to define ARGV");
       g_object_unref (context);
       g_hash_table_unref (statistics);
       return 1;
@@ -512,7 +568,18 @@ int main (int argc, char **argv)
       g_printerr ("Error in evaluating js : %s\n", error->message);
     }
 
-  g_hash_table_foreach (statistics, print_statistics_for_files, NULL);
+  GjsCoverageTracefile tracefile_data =
+  {
+    tracefile_output_path,
+    NULL
+  };
+
+  g_hash_table_foreach (statistics, print_statistics_for_files, &tracefile_data);
+
+  /* print_statistics_for_files might try to open the tracefile, so
+   * we need to check for this and unref it if so */
+  if (tracefile_data.open_handle)
+    g_object_unref (tracefile_data.open_handle);
 
   g_hash_table_unref (statistics);
   g_object_unref (context);
@@ -525,6 +592,9 @@ int main (int argc, char **argv)
 
   if (js_version)
     g_free(js_version);
+
+  if (tracefile_output_path)
+    g_free(tracefile_output_path);
 
   return 0;
 }
