@@ -46,6 +46,9 @@ set_interrupts (JSContext *context,
   JS_SetInterrupt (JS_GetRuntime (context), hook, user_data);
 }
 
+JSCrossCompartmentCall * JS_EnterCrossCompartmentCallScript (JSContext *context,
+                                                             JSScript  *script);
+
 static void
 disable_interrupts_for_script (JSContext *context,
                                JSScript  *script)
@@ -151,17 +154,47 @@ is_single_line_comment (const gchar *str)
   return FALSE;
 }
 
-//static const gchar *
-//search_backwards_for_substr (const gchar *haystack, const gchar *needle, )
+static const gchar *
+search_backwards_for_substr (const gchar *haystack,
+                             const gchar *needle,
+                             const gchar *position)
+{
+  guint needle_length = strlen (needle);
+
+  /* Search backwards for the first character, then try and
+   * strcmp if there's a match. Removes needless jumping around
+   * into strcmp */
+  while (position != haystack)
+    {
+      if (position[0] == needle[0] &&
+          strncmp (position, needle, needle_length) == 0)
+        return position;
+
+      --position;
+    }
+
+  return NULL;
+}
 
 static gboolean
 is_within_comment_block (const gchar *str, const gchar *begin)
 {
-  if (str[0] == '*')
-    {
-      const gchar *previousCommentBeginToken = str;
-      const gchar *previousCommentEndToken = str;
-    }
+  static const gchar *previousCommentBeginIdentifier = "/*";
+  static const gchar *previousCommentEndIdentifier = "*/";
+  const gchar *previousCommentBeginToken = search_backwards_for_substr (begin,
+                                                                        previousCommentBeginIdentifier,
+                                                                        str);
+  const gchar *previousCommentEndToken = search_backwards_for_substr (begin,
+                                                                      previousCommentEndIdentifier,
+                                                                      str);
+
+  /* We are in a comment block if previousCommentBegin > previousCommentEnd or
+   * if there is no previous comment end */
+  const gboolean withinCommentBlock =
+      previousCommentBeginToken > previousCommentEndToken ||
+      previousCommentBeginToken && !previousCommentEndToken;
+
+  return withinCommentBlock;
 }
 
 static gboolean
@@ -180,7 +213,8 @@ is_nonexecutable_line (const gchar *data,
   str = advance_past_leading_nonexecutable_characters (str);
 
   return is_only_newline (str) ||
-         is_single_line_comment (str);
+         is_single_line_comment (str) ||
+         is_within_comment_block (str, data);
 }
 
 static void
@@ -207,10 +241,7 @@ determine_executable_lines (JSContext *context,
     {
       if (g_array_index (statistics, gint, lines[i]) == -1 &&
           !is_nonexecutable_line (data, lines[i]))
-        {
-          //g_print ("making line %s:%i executable\n", JS_GetScriptFilename (context, script), lines[i]);
           g_array_index (statistics, gint, lines[i]) = 0;
-        }
     }
 
   JS_free (context, lines);
@@ -315,14 +346,21 @@ void print_statistics_for_files (gpointer key,
   g_file_create (tracefile, G_FILE_CREATE_REPLACE_DESTINATION, NULL, NULL);
   GFileIOStream *iostream = g_file_open_readwrite (tracefile, NULL, NULL);
   GOutputStream *ostream = g_io_stream_get_output_stream ((GIOStream *) iostream);
+  gchar *current_directory = g_get_current_dir();
+  gchar *absolute_path_to_source_file = g_strconcat (current_directory, "/", (const gchar *) key, NULL);
+  
+  g_free (current_directory);
 
   write_to_stream (ostream, "SF:");
-  write_to_stream (ostream, (const gchar *) key);
+  write_to_stream (ostream, absolute_path_to_source_file);
   write_to_stream (ostream, "\n");
   write_to_stream (ostream, "FNF:0\n");
   write_to_stream (ostream, "FNH:0\n");
   write_to_stream (ostream, "BRF:0\n");
   write_to_stream (ostream, "BRH:0\n");
+  
+  g_free (absolute_path_to_source_file);
+  
   GArray *stats = value;
 
   guint i = 0;
@@ -334,10 +372,7 @@ void print_statistics_for_files (gpointer key,
       gint hit_count_for_line = g_array_index (stats, gint, i);
 
       if (hit_count_for_line == -1)
-        {
-          //g_print ("skipping line %s:%i\n", key, i);
           continue;
-        }
 
       write_to_stream (ostream, "DA:");
 
@@ -394,8 +429,6 @@ int main (int argc, char **argv)
       g_hash_table_unref (statistics);
       return 1;
     }
-
-  printf ("defined ARGV %s\n", *(argv + 2));
 
   int status;
   GError *error = NULL;
