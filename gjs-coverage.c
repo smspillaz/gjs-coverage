@@ -544,7 +544,7 @@ int main (int argc, char **argv)
   JSContext *js_context = gjs_context_get_native_context (context);
   JSRuntime *js_runtime = JS_GetRuntime (js_context);
   JS_BeginRequest (js_context);
-  JS_SetOptions (js_context, JSOPTION_METHODJIT);
+  JS_SetOptions (js_context, JS_GetOptions (js_context) | JSOPTION_METHODJIT);
   JS_SetDebugMode (js_context, TRUE);
   JS_SetNewScriptHookProc (js_runtime, new_script_hook, &coverage_data);
   JS_EndRequest (js_context);
