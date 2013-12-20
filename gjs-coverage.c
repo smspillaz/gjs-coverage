@@ -5,73 +5,8 @@
 #include <gio/gio.h>
 #include <gjs/gjs.h>
 
-static JSTrapStatus
-interrupt_hook (JSContext *context,
-                JSScript *script,
-                jsbytecode *pc,
-                jsval *rval,
-                void *closure)
-{
-  const gchar *filename = (const gchar *) JS_GetScriptFilename (context,
-                                                                script);
-  GArray *statistics = g_hash_table_lookup ((GHashTable *) closure,
-                                            filename);
-  /* This shouldn't really happen, but if it does just return early */
-  if (!statistics)
-    return JSTRAP_CONTINUE;
-
-  guint lineNo = JS_PCToLineNumber (context, script, pc);
-
-  g_assert (lineNo <= statistics->len);
-
-  /* If this happens it is not a huge problem - we only try to
-   * filter out lines which we think are not executable so
-   * that they don't cause execess noise in coverage reports */
-  if (g_array_index (statistics, gint, lineNo) == -1)
-      g_array_index (statistics, gint, lineNo) = 0;
-
-  ++(g_array_index (statistics, gint, lineNo));
-  return JSTRAP_CONTINUE;
-}
-
-static void
-set_interrupts (JSContext *context,
-                JSScript *script,
-                JSInterruptHook hook,
-                gpointer user_data)
-{
-  if (hook)
-    JS_SetSingleStepMode (context, script, TRUE);
-
-  JS_SetInterrupt (JS_GetRuntime (context), hook, user_data);
-}
-
-JSCrossCompartmentCall * JS_EnterCrossCompartmentCallScript (JSContext *context,
-                                                             JSScript  *script);
-
-static void
-disable_interrupts_for_script (JSContext *context,
-                               JSScript  *script)
-{
-  JSCrossCompartmentCall *call = JS_EnterCrossCompartmentCallScript (context, script);
-  JS_BeginRequest (context);
-  set_interrupts (context, script, NULL, NULL);
-  JS_EndRequest (context);
-  JS_LeaveCrossCompartmentCall (call);
-}
-
-static void
-enable_interrupts_for_script (JSContext *context,
-                              JSScript *script,
-                              JSInterruptHook hook,
-                              gpointer user_data)
-{
-  JSCrossCompartmentCall *call = JS_EnterCrossCompartmentCallScript (context, script);
-  JS_BeginRequest (context);
-  set_interrupts (context, script, hook, user_data);
-  JS_EndRequest (context);
-  JS_LeaveCrossCompartmentCall (call);
-}
+#include "gjs-debug-interrupt-register.h"
+#include "gjs-interrupt-register.h"
 
 typedef void (*LineForeachFunc) (const gchar *str,
                                  gpointer    user_data);
@@ -108,161 +43,42 @@ count_lines_in_string (const gchar *data)
   return lineCount;
 }
 
-typedef struct _ExecutableDeterminationData
-{
-  guint currentLine;
-  const gchar *filename;
-  GArray *statistics;
-} ExecutableDeterminationData;
-
-static gboolean
-is_nonexecutable_character (gchar character)
-{
-  return character == ' ' ||
-         character == ';' ||
-         character == ']' ||
-         character == '}' ||
-         character == ')';
-}
-
-const gchar *
-advance_past_leading_nonexecutable_characters (const gchar *str)
-{
-  while (is_nonexecutable_character (str[0]))
-    ++str;
-
-  return str;
-}
-
-static gboolean
-is_only_newline (const gchar *str)
-{
-  if (str[0] == '\n')
-    {
-      return TRUE;
-    }
-
-  return FALSE;
-}
-
-static gboolean
-is_single_line_comment (const gchar *str)
-{
-  if (strncmp (str, "//", 2) == 0)
-    return TRUE;
-
-  return FALSE;
-}
-
-static const gchar *
-search_backwards_for_substr (const gchar *haystack,
-                             const gchar *needle,
-                             const gchar *position)
-{
-  guint needle_length = strlen (needle);
-
-  /* Search backwards for the first character, then try and
-   * strcmp if there's a match. Removes needless jumping around
-   * into strcmp */
-  while (position != haystack)
-    {
-      if (position[0] == needle[0] &&
-          strncmp (position, needle, needle_length) == 0)
-        return position;
-
-      --position;
-    }
-
-  return NULL;
-}
-
-static gboolean
-is_within_comment_block (const gchar *str, const gchar *begin)
-{
-  static const gchar *previousCommentBeginIdentifier = "/*";
-  static const gchar *previousCommentEndIdentifier = "*/";
-  const gchar *previousCommentBeginToken = search_backwards_for_substr (begin,
-                                                                        previousCommentBeginIdentifier,
-                                                                        str);
-  const gchar *previousCommentEndToken = search_backwards_for_substr (begin,
-                                                                      previousCommentEndIdentifier,
-                                                                      str);
-
-  /* We are in a comment block if previousCommentBegin > previousCommentEnd or
-   * if there is no previous comment end */
-  const gboolean withinCommentBlock =
-      previousCommentBeginToken > previousCommentEndToken ||
-      previousCommentBeginToken && !previousCommentEndToken;
-
-  return withinCommentBlock;
-}
-
-static gboolean
-is_nonexecutable_line (const gchar *data,
-                       guint       lineNumber)
-{
-  const gchar *str = data;
-  guint lineNo = lineNumber;
-  while (--lineNumber)
-    {
-      str = strstr (str, "\n");
-      g_assert (str);
-      str += 1;
-    }
-
-  str = advance_past_leading_nonexecutable_characters (str);
-
-  return is_only_newline (str) ||
-         is_single_line_comment (str) ||
-         is_within_comment_block (str, data);
-}
-
 static void
-determine_executable_lines (JSContext *context,
-                            JSScript  *script,
-                            guint     begin,
-                            GArray    *statistics,
-                            const gchar *data)
+mark_executable_lines (GArray *lines,
+                       guint  *executable_lines,
+                       guint  n_executable_lines)
 {
-  jsbytecode **program_counters;
-  unsigned int *lines;
-  unsigned int count;
-
-  if (!JS_GetLinePCs (context, script, begin, UINT_MAX,
-                      &count,
-                      &lines,
-                      &program_counters))
-    {
-      exit (1);
-    }
-
-  unsigned int i = 0;
-  for (; i < count; ++i)
-    {
-      if (g_array_index (statistics, gint, lines[i]) == -1 &&
-          !is_nonexecutable_line (data, lines[i]))
-          g_array_index (statistics, gint, lines[i]) = 0;
-    }
-
-  JS_free (context, lines);
-  JS_free (context, program_counters);
+  guint i = 0;
+  for (; i < n_executable_lines; ++i)
+      g_array_index (lines, gint, executable_lines[i]) = 0;
 }
 
 static GArray *
 lookup_or_create_statistics (GHashTable *table,
-                             const gchar *filename,
-                             const gchar *data)
+                             const gchar *filename)
 {
   GArray *statistics = g_hash_table_lookup (table, filename);
   if (statistics)
     return statistics;
 
-  guint lineCount = count_lines_in_string (data);
+  gchar *lines = NULL;
+  gsize length = 0;
+
+  if (!g_file_get_contents (filename,
+                            &lines,
+                            &length,
+                            NULL))
+    return NULL;
+
+  guint lineCount = count_lines_in_string (lines);
 
   statistics = g_array_new (TRUE, FALSE, sizeof (gint));
   g_array_set_size (statistics, lineCount);
   memset (statistics->data, -1, sizeof (gint) * statistics->len);
   g_hash_table_insert (table, g_strdup (filename), statistics);
+
+  g_free (lines);
+
   return statistics;
 }
 
@@ -303,60 +119,20 @@ typedef struct _GjsCoverageData
   GHashTable  *statistics;
 } GjsCoverageData;
 
-static void
-new_script_hook (JSContext *context,
-                 const char *filename,
-                 unsigned lineno,
-                 JSScript *script,
-                 JSFunction *function,
-                 void *caller_data)
+static gboolean
+should_skip_this_script (const gchar     *filename,
+                         GjsCoverageData *coverage_data)
 {
-  disable_interrupts_for_script (context, script);
-
-  GjsCoverageData *coverage_data = (GjsCoverageData *) caller_data;
-
   /* We don't want coverage data on installed scripts */
   if (str_contained_in_env (filename, "XDG_DATA_DIRS"))
-    return;
+    return TRUE;
   if (coverage_data->exclude_paths &&
       strv_element_contained_in_string (filename,
                                         coverage_data->exclude_paths,
                                         g_strv_length ((gchar **) coverage_data->exclude_paths)))
-    return;
+    return TRUE;
 
-  /* Count the number of lines in the file */
-  GFile *file = g_file_new_for_path (filename);
-  g_assert (file);
-
-  GFileInputStream *stream = g_file_read (file, NULL, NULL);
-
-  /* It isn't a file, so we can't do coverage reports on it */
-  if (!stream)
-    {
-      g_object_unref (file);
-      return;
-    }
-
-  g_seekable_seek ((GSeekable *) stream, 0, G_SEEK_END, NULL, NULL);
-  goffset data_count = g_seekable_tell ((GSeekable *) stream);
-  g_object_unref (stream);
-
-  stream = g_file_read (file, NULL, NULL);
-
-  char data[data_count];
-  gsize bytes_read;
-  g_input_stream_read_all ((GInputStream *) stream, (void *) data, data_count, &bytes_read, NULL, NULL);
-
-  g_assert (bytes_read == data_count);
-
-  /* Add information about any executable lines to this script */
-  GArray *statistics = lookup_or_create_statistics (coverage_data->statistics, filename, data);
-  determine_executable_lines (context, script, lineno, statistics, data);
-
-  enable_interrupts_for_script (context, script, interrupt_hook, coverage_data->statistics);
-
-  g_object_unref (stream);
-  g_object_unref (file);
+  return FALSE;
 }
 
 void write_to_stream (GOutputStream *ostream,
@@ -386,7 +162,6 @@ create_tracefile_for_script_name (const gchar *script_name)
   gsize tracefile_name_buffer_size = strlen ((const gchar *) script_name) + 8;
   gchar tracefile_name_buffer[tracefile_name_buffer_size];
   snprintf (tracefile_name_buffer, tracefile_name_buffer_size, "%s.info", (const gchar *) script_name);
-  g_print("created tracefile %s\n", tracefile_name_buffer);
 
   return delete_file_at_path_and_open_anew (tracefile_name_buffer);
 }
@@ -474,6 +249,51 @@ void print_statistics_for_files (gpointer key,
   g_object_unref (tracefile);
 }
 
+static void
+interrupt_callback_for_register (GjsInterruptRegister *reg,
+                                 GjsContext           *context,
+                                 GjsInterruptInfo     *info,
+                                 gpointer             user_data)
+{
+  const gchar *filename = info->filename;
+  GArray *statistics = g_hash_table_lookup ((GHashTable *) user_data,
+                                            filename);
+  /* This shouldn't really happen, but if it does just return early */
+  if (!statistics)
+    return;
+
+  guint lineNo = info->line;
+
+  g_assert (lineNo <= statistics->len);
+
+  /* If this happens it is not a huge problem - we only try to
+   * filter out lines which we think are not executable so
+   * that they don't cause execess noise in coverage reports */
+  if (g_array_index (statistics, gint, lineNo) == -1)
+      g_array_index (statistics, gint, lineNo) = 0;
+
+  ++(g_array_index (statistics, gint, lineNo));
+}
+
+static void
+new_script_callback_for_register (GjsInterruptRegister *reg,
+                                  GjsContext           *context,
+                                  GjsDebugScriptInfo   *info,
+                                  gpointer             user_data)
+{
+  GjsCoverageData *coverage_data = (GjsCoverageData *) user_data;
+
+  /* We don't want coverage data on installed scripts */
+  if (should_skip_this_script (info->filename, coverage_data))
+    return;
+
+  GArray *statistics = lookup_or_create_statistics (coverage_data->statistics,
+                                                    info->filename);
+  mark_executable_lines (statistics,
+                         info->executable_lines,
+                         info->n_executable_lines);
+}
+
 int main (int argc, char **argv)
 {
   if (argc < 2)
@@ -541,13 +361,16 @@ int main (int argc, char **argv)
     statistics
   };
 
-  JSContext *js_context = gjs_context_get_native_context (context);
-  JSRuntime *js_runtime = JS_GetRuntime (js_context);
-  JS_BeginRequest (js_context);
-  JS_SetOptions (js_context, JS_GetOptions (js_context) | JSOPTION_METHODJIT);
-  JS_SetDebugMode (js_context, TRUE);
-  JS_SetNewScriptHookProc (js_runtime, new_script_hook, &coverage_data);
-  JS_EndRequest (js_context);
+  GjsDebugInterruptRegister *debug_register =
+      gjs_debug_interrupt_register_new (context);
+  GjsDebugConnection *single_step_connection =
+      gjs_interrupt_register_start_singlestep (GJS_INTERRUPT_REGISTER_INTERFACE (debug_register),
+                                               interrupt_callback_for_register,
+                                               statistics);
+  GjsDebugConnection *new_script_hook_connection =
+      gjs_interrupt_register_connect_to_script_load (GJS_INTERRUPT_REGISTER_INTERFACE (debug_register),
+                                                     new_script_callback_for_register,
+                                                     &coverage_data);
 
   if (!gjs_context_define_string_array (context,
                                         "ARGV",
@@ -567,6 +390,10 @@ int main (int argc, char **argv)
     {
       g_printerr ("Error in evaluating js : %s\n", error->message);
     }
+
+  g_object_unref (single_step_connection);
+  g_object_unref (new_script_hook_connection);
+  g_object_unref (debug_register);
 
   GjsCoverageTracefile tracefile_data =
   {
