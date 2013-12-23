@@ -45,6 +45,7 @@ struct _GjsDebugInterruptRegisterPrivate
   /* These are data structures which contain callback points
    * whenever our internal JS debugger hooks get called */
   GHashTable *breakpoints;
+  GHashTable *pending_breakpoints;
   GArray     *single_step_hooks;
   GArray     *call_and_execute_hooks;
   GArray     *new_script_hooks;
@@ -303,7 +304,219 @@ gjs_debug_interrupt_register_clear_script_info_dynamic (GjsDebugScriptInfo *info
     g_free (info->executable_lines);
 }
 
+typedef struct _GjsBreakpoint
+{
+  JSScript *script;
+  jsbytecode *pc;
+} GjsBreakpoint;
+
+static void
+gjs_breakpoint_destroy (gpointer data)
+{
+  GjsBreakpoint *breakpoint = (GjsBreakpoint *) data;
+
+  g_free (breakpoint);
+}
+
+static GjsBreakpoint *
+gjs_breakpoint_new (JSScript   *script,
+                    jsbytecode *pc)
+{
+  GjsBreakpoint *breakpoint = g_new0 (GjsBreakpoint, 1);
+  breakpoint->script = script;
+  breakpoint->pc = pc;
+  return breakpoint;
+}
+
+typedef struct _GjsPendingBreakpoint
+{
+  gchar *filename;
+  guint lineno;
+} GjsPendingBreakpoint;
+
+static void
+gjs_pending_breakpoint_destroy (gpointer data)
+{
+  GjsPendingBreakpoint *pending = (GjsPendingBreakpoint *) data;
+  g_free (pending->filename);
+  g_free (pending);
+}
+
+static GjsPendingBreakpoint *
+gjs_pending_breakpoint_new (const gchar *filename,
+                            guint       lineno)
+{
+  GjsPendingBreakpoint *pending = g_new0 (GjsPendingBreakpoint, 1);
+  pending->filename = g_strdup (filename);
+  pending->lineno = lineno;
+  return pending;
+}
+
+typedef struct _BreakpointActivationData
+{
+  GjsDebugInterruptRegister *debug_register;
+  JSContext                 *js_context;
+  JSScript                  *js_script;
+  const gchar               *filename;
+  guint                     begin_lineno;
+  GHashTable                *breakpoints;
+  GList                     *breakpoints_changed;
+} BreakpointActivationData;
+
+static void
+remove_breakpoint_from_hashtable_by_user_callback (gpointer list_item,
+                                                   gpointer hashtable_pointer)
+{
+  GHashTable           *breakpoints = (GHashTable *) hashtable_pointer;
+  GjsPendingBreakpoint *pending_breakpoint = (GjsPendingBreakpoint *) g_hash_table_lookup (breakpoints, list_item);
+
+  gjs_pending_breakpoint_destroy (pending_breakpoint);
+  g_hash_table_remove (breakpoints, list_item);
+}
+
+static void
+remove_activated_breakpoints_from_pending (BreakpointActivationData *data,
+                                           GHashTable               *pending)
+{
+  if (data->breakpoints_changed)
+    {
+      g_list_foreach (data->breakpoints_changed,
+                      remove_breakpoint_from_hashtable_by_user_callback,
+                      pending);
+      g_list_free (data->breakpoints_changed);
+    }
+}
+
+static guint
+get_script_end_lineno (JSContext *js_context,
+                       JSScript  *js_script)
+{
+  jsbytecode *pc = JS_EndPC (js_context, js_script);
+  return JS_PCToLineNumber (js_context,
+                            js_script,
+                            pc);
+}
+
+typedef struct _GjsDebugInterruptRegisterTrapPrivateData
+{
+  GjsDebugInterruptRegister *reg;
+  GjsDebugUserCallback *user_callback;
+} GjsDebugInterruptRegisterTrapPrivateData;
+
+GjsDebugInterruptRegisterTrapPrivateData *
+gjs_debug_interrupt_register_trap_private_data_new (GjsDebugInterruptRegister *reg,
+                                                    GjsDebugUserCallback      *user_callback)
+{
+  GjsDebugInterruptRegisterTrapPrivateData *data =
+      g_new0 (GjsDebugInterruptRegisterTrapPrivateData, 1);
+
+  data->reg = reg;
+  data->user_callback = user_callback;
+
+  return data;
+}
+
+static void
+gjs_debug_interrupt_register_trap_private_data_destroy (GjsDebugInterruptRegisterTrapPrivateData *data)
+{
+  g_free (data);
+}
+
 /* Callbacks */
+static JSTrapStatus
+gjs_debug_interrupt_register_trap_handler (JSContext  *context,
+                                           JSScript   *script,
+                                           jsbytecode *pc,
+                                           jsval      *rval,
+                                           jsval      closure)
+{
+  GjsDebugInterruptRegisterTrapPrivateData *data =
+      (GjsDebugInterruptRegisterTrapPrivateData *) JSVAL_TO_PRIVATE (closure);
+
+  /* And there goes the law of demeter */
+  GjsDebugInterruptRegister *reg = data->reg;
+  GjsInterruptInfo interrupt_info;
+  GjsInterruptCallback callback = (GjsInterruptCallback) data->user_callback->callback;
+  gjs_debug_interrupt_register_populate_interrupt_info (&interrupt_info, context, script, pc);
+
+  (*callback) (GJS_INTERRUPT_REGISTER_INTERFACE (reg),
+               reg->priv->context,
+               &interrupt_info,
+               data->user_callback->user_data);
+
+  gjs_debug_interrupt_register_clear_interrupt_info_dynamic (&interrupt_info);
+
+  return JSTRAP_CONTINUE;
+}
+
+static GjsBreakpoint *
+gjs_debug_create_native_breakpoint_for_script (GjsDebugInterruptRegister *reg,
+                                               JSContext                 *js_context,
+                                               JSScript                  *script,
+                                               guint                     line,
+                                               GjsDebugUserCallback      *user_callback)
+{
+  GjsDebugInterruptRegisterTrapPrivateData *data =
+      gjs_debug_interrupt_register_trap_private_data_new (reg, user_callback);
+  /* This always succeeds, although it might only return the very-end
+   * or very-beginning program counter if the line is out of range */
+  jsbytecode *pc =
+      JS_LineNumberToPC (js_context, script, line);
+
+  /* Set the breakpoint on the JS side now that we're tracking it */
+  JS_SetTrap (js_context,
+              script,
+              pc,
+              gjs_debug_interrupt_register_trap_handler,
+              PRIVATE_TO_JSVAL (data));
+
+  return gjs_breakpoint_new (script, pc);
+}
+
+/* FIXME */
+static void gjs_debug_interrupt_register_unlock_new_script_callback (GjsDebugInterruptRegister *reg);
+
+static void
+activate_breakpoint_if_within_script (gpointer key,
+                                      gpointer value,
+                                      gpointer user_data)
+{
+  GjsPendingBreakpoint     *pending = (GjsPendingBreakpoint *) value;
+  BreakpointActivationData *activation_data = (BreakpointActivationData *) user_data;
+
+  /* Interrogate the script for its last program counter and thus its
+   * last line. If the desired breakpoint line falls within this script's
+   * line range then activate it. */
+  if (strcmp (activation_data->filename, pending->filename) == 0)
+    {
+      guint end_lineno = get_script_end_lineno (activation_data->js_context,
+                                                activation_data->js_script);
+
+      if (activation_data->begin_lineno <= pending->lineno &&
+          end_lineno >= pending->lineno)
+        {
+          GjsBreakpoint *breakpoint =
+              gjs_debug_create_native_breakpoint_for_script (activation_data->debug_register,
+                                                             activation_data->js_context,
+                                                             activation_data->js_script,
+                                                             pending->lineno,
+                                                             (GjsDebugUserCallback *) key);
+          g_hash_table_insert (activation_data->breakpoints,
+                               key,
+                               breakpoint);
+
+          /* We append "key" here as that is what we need to remove-by later */
+          activation_data->breakpoints_changed =
+              g_list_append (activation_data->breakpoints_changed,
+                             key);
+
+          /* Decrement new script callback, we might not need to know about
+           * new scripts anymore as the breakpoint is no longer pending */
+          gjs_debug_interrupt_register_unlock_new_script_callback (activation_data->debug_register);
+        }
+    }
+}
+
 static void
 gjs_debug_interrupt_register_new_script_callback (JSContext    *context,
                                                   const gchar  *filename,
@@ -325,6 +538,25 @@ gjs_debug_interrupt_register_new_script_callback (JSContext    *context,
    * here */
   if (reg->priv->single_step_mode_lock_count)
     JS_SetSingleStepMode (js_context, script, TRUE);
+
+  /* Special case - search pending breakpoints for the current script filename
+   * and convert them to real breakpoints if need be */
+  BreakpointActivationData activation_data =
+  {
+    reg,
+    js_context,
+    script,
+    filename,
+    lineno,
+    reg->priv->breakpoints,
+    NULL
+  };
+
+  g_hash_table_foreach (reg->priv->pending_breakpoints,
+                        activate_breakpoint_if_within_script,
+                        &activation_data);
+  remove_activated_breakpoints_from_pending (&activation_data,
+                                             reg->priv->pending_breakpoints);
 
   GjsDebugScriptInfo debug_script_info;
   gjs_debug_interrupt_register_populate_script_info (&debug_script_info,
@@ -362,57 +594,6 @@ gjs_debug_interrupt_register_script_destroyed_callback (JSFreeOp     *fo,
   };
 
   g_hash_table_remove (reg->priv->scripts_loaded, &info);
-}
-
-typedef struct _GjsDebugInterruptRegisterTrapPrivateData
-{
-  GjsDebugInterruptRegister *reg;
-  GjsDebugUserCallback *user_callback;
-} GjsDebugInterruptRegisterTrapPrivateData;
-
-GjsDebugInterruptRegisterTrapPrivateData *
-gjs_debug_interrupt_register_trap_private_data_new (GjsDebugInterruptRegister *reg,
-                                                    GjsDebugUserCallback      *user_callback)
-{
-  GjsDebugInterruptRegisterTrapPrivateData *data =
-      g_new0 (GjsDebugInterruptRegisterTrapPrivateData, 1);
-
-  data->reg = reg;
-  data->user_callback = user_callback;
-
-  return data;
-}
-
-static void
-gjs_debug_interrupt_register_trap_private_data_destroy (GjsDebugInterruptRegisterTrapPrivateData *data)
-{
-  g_free (data);
-}
-
-static JSTrapStatus
-gjs_debug_interrupt_register_trap_handler (JSContext  *context,
-                                           JSScript   *script,
-                                           jsbytecode *pc,
-                                           jsval      *rval,
-                                           jsval      closure)
-{
-  GjsDebugInterruptRegisterTrapPrivateData *data =
-      (GjsDebugInterruptRegisterTrapPrivateData *) JSVAL_TO_PRIVATE (closure);
-
-  /* And there goes the law of demeter */
-  GjsDebugInterruptRegister *reg = data->reg;
-  GjsInterruptInfo interrupt_info;
-  GjsInterruptCallback callback = (GjsInterruptCallback) data->user_callback->callback;
-  gjs_debug_interrupt_register_populate_interrupt_info (&interrupt_info, context, script, pc);
-
-  (*callback) (GJS_INTERRUPT_REGISTER_INTERFACE (reg),
-               reg->priv->context,
-               &interrupt_info,
-               data->user_callback->user_data);
-
-  gjs_debug_interrupt_register_clear_interrupt_info_dynamic (&interrupt_info);
-
-  return JSTRAP_CONTINUE;
 }
 
 static JSTrapStatus
@@ -734,6 +915,7 @@ set_function_calls_and_execution_hooks (JSContext *context,
   FunctionCallsAndExecutionHooksData *data = (FunctionCallsAndExecutionHooksData *) user_data;
 
   JS_SetExecuteHook (js_runtime, data->hook, data->user_data);
+  JS_SetCallHook (js_runtime, data->hook, data->user_data);
 }
 
 static void
@@ -752,7 +934,7 @@ gjs_debug_interrupt_register_lock_function_calls_and_execution (GjsDebugInterrup
 }
 
 static void
-gjs_debug_interrupt_register_unlock_function_calls_and_exectuion (GjsDebugInterruptRegister *reg)
+gjs_debug_interrupt_register_unlock_function_calls_and_execution (GjsDebugInterruptRegister *reg)
 {
   FunctionCallsAndExecutionHooksData data =
   {
@@ -766,66 +948,69 @@ gjs_debug_interrupt_register_unlock_function_calls_and_exectuion (GjsDebugInterr
                                 &data);
 }
 
-typedef struct _GjsBreakpoint
-{
-  JSScript *script;
-  jsbytecode *pc;
-} GjsBreakpoint;
-
-static void
-gjs_breakpoint_destroy (gpointer data)
-{
-  GjsBreakpoint *breakpoint = (GjsBreakpoint *) data;
-
-  g_free (breakpoint);
-}
-
-static GjsBreakpoint *
-gjs_breakpoint_new (JSScript   *script,
-                    jsbytecode *pc)
-{
-  GjsBreakpoint *breakpoint = g_new0 (GjsBreakpoint, 1);
-  breakpoint->script = script;
-  breakpoint->pc = pc;
-  return breakpoint;
-}
-
 static void
 gjs_debug_interrupt_register_remove_breakpoint (GjsDebugConnection *connection,
                                                 gpointer           user_data)
 {
   GjsDebugInterruptRegister *reg = GJS_DEBUG_INTERRUPT_REGISTER (user_data);
   JSContext *js_context = (JSContext *) gjs_context_get_native_context (reg->priv->context);
-  GjsBreakpoint *breakpoint =
-      (GjsBreakpoint *) g_hash_table_lookup (reg->priv->breakpoints_connections,
-                                             connection);
   GjsDebugUserCallback *callback =
-      (GjsDebugUserCallback *) g_hash_table_lookup (reg->priv->breakpoints, breakpoint);
+      (GjsDebugUserCallback *) g_hash_table_lookup (reg->priv->breakpoints_connections,
+                                                    connection);
+  GjsBreakpoint *breakpoint =
+      (GjsBreakpoint *) g_hash_table_lookup (reg->priv->breakpoints, callback);
+
+  gboolean item_was_removed = FALSE;
+
+  /* Remove breakpoint if there was one */
+  if (breakpoint)
+    {
+      g_hash_table_remove (reg->priv->breakpoints, callback);
+
+      jsval previous_closure;
+
+      JS_ClearTrap (js_context,
+                    breakpoint->script,
+                    breakpoint->pc,
+                    NULL,
+                    &previous_closure);
+
+      GjsDebugInterruptRegisterTrapPrivateData *private_data =
+          (GjsDebugInterruptRegisterTrapPrivateData *) JSVAL_TO_PRIVATE (previous_closure);
+      gjs_debug_interrupt_register_trap_private_data_destroy (private_data);
+
+      gjs_breakpoint_destroy (breakpoint);
+      item_was_removed = TRUE;
+    }
+
+  GjsPendingBreakpoint *pending_breakpoint =
+      (GjsPendingBreakpoint *) g_hash_table_lookup (reg->priv->pending_breakpoints, callback);
+
+  if (pending_breakpoint)
+    {
+      g_hash_table_remove (reg->priv->pending_breakpoints, callback);
+      gjs_pending_breakpoint_destroy (pending_breakpoint);
+
+      /* When removing a pending breakpoint, we must also unlock the new
+       * script hook as we might not care about new scripts anymore if pending
+       * breakpoints are empty */
+      gjs_debug_interrupt_register_unlock_new_script_callback (reg);
+
+      item_was_removed = TRUE;
+    }
+
+  g_assert (item_was_removed);
 
   g_hash_table_remove (reg->priv->breakpoints_connections, connection);
-  g_hash_table_remove (reg->priv->breakpoints, breakpoint);
-
-  jsval previous_closure;
-
-  JS_ClearTrap (js_context,
-                breakpoint->script,
-                breakpoint->pc,
-                NULL,
-                &previous_closure);
-
-  GjsDebugInterruptRegisterTrapPrivateData *private_data =
-      (GjsDebugInterruptRegisterTrapPrivateData *) JSVAL_TO_PRIVATE (previous_closure);
-  gjs_debug_interrupt_register_trap_private_data_destroy (private_data);
-
-  gjs_breakpoint_destroy (breakpoint);
+  gjs_debug_user_callback_free (callback);
 
   gjs_debug_interrupt_register_unlock_debug_mode (reg);
 }
 
 typedef struct _GjsScriptHashTableSearchData
 {
+  JSContext *js_context;
   JSScript *return_result;
-  guint current_line;
   const gchar *filename;
   guint line;
 } GjsScriptHashTableSearchData;
@@ -833,15 +1018,23 @@ typedef struct _GjsScriptHashTableSearchData
 void
 search_for_script_with_closest_baseline_floor_callback (gpointer key,
                                                         gpointer value,
-                                                        gpointer      user_data)
+                                                        gpointer user_data)
 {
   GjsScriptHashTableSearchData *data = (GjsScriptHashTableSearchData *) user_data;
-  GjsDebugScriptLookupInfo *info = (GjsDebugScriptLookupInfo *) key;
-  if (g_strcmp0 (info->name, data->filename) == 0 &&
-      info->lineno < data->current_line &&
-      info->lineno < data->line)
+
+  if (!data->return_result)
     {
-      data->return_result = (JSScript *) value;
+      GjsDebugScriptLookupInfo     *info = (GjsDebugScriptLookupInfo *) key;
+      if (g_strcmp0 (info->name, data->filename) == 0)
+        {
+          JSScript *script = (JSScript *) value;
+          guint    script_end_line = get_script_end_lineno (data->js_context,
+                                                            script);
+
+          if (info->lineno <= data->line &&
+              script_end_line >= data->line)
+            data->return_result = (JSScript *) value;
+        }
     }
 }
 
@@ -852,8 +1045,8 @@ lookup_script_for_filename_with_closest_baseline_floor (GjsDebugInterruptRegiste
 {
   GjsScriptHashTableSearchData data =
   {
+    (JSContext *) gjs_context_get_native_context (reg->priv->context),
     NULL,
-    0,
     filename,
     line
   };
@@ -861,6 +1054,30 @@ lookup_script_for_filename_with_closest_baseline_floor (GjsDebugInterruptRegiste
   g_hash_table_foreach (reg->priv->scripts_loaded,
                         search_for_script_with_closest_baseline_floor_callback,
                         &data);
+
+  return data.return_result;
+}
+
+static GjsBreakpoint *
+lookup_line_and_create_native_breakpoint (JSContext                 *js_context,
+                                          GjsDebugInterruptRegister *debug_register,
+                                          const gchar               *filename,
+                                          guint                     line,
+                                          GjsDebugUserCallback      *user_callback)
+{
+  JSScript *script =
+    lookup_script_for_filename_with_closest_baseline_floor (debug_register,
+                                                            filename,
+                                                            line);
+
+  if (!script)
+      return NULL;
+
+  return gjs_debug_create_native_breakpoint_for_script (debug_register,
+                                                        js_context,
+                                                        script,
+                                                        line,
+                                                        user_callback);
 }
 
 static GjsDebugConnection *
@@ -868,56 +1085,52 @@ gjs_debug_interrupt_register_add_breakpoint (GjsInterruptRegister *reg,
                                              const gchar          *filename,
                                              guint                line,
                                              GjsInterruptCallback callback,
-                                             gpointer             user_data,
-                                             GError               **error)
+                                             gpointer             user_data)
 {
   GjsDebugInterruptRegister *debug_register = GJS_DEBUG_INTERRUPT_REGISTER (reg);
 
   JSContext *js_context =
     (JSContext *) gjs_context_get_native_context (debug_register->priv->context);
-  JSScript *script =
-    lookup_script_for_filename_with_closest_baseline_floor (debug_register,
-                                                            filename,
-                                                            line);
 
-  if (!script)
-    {
-      g_set_error (error,
-                   0,
-                   0,
-                   "Could not find a script satisfying %s:%i\n",
-                   filename,
-                   line);
-      return NULL;
-    }
-
-  jsbytecode *pc =
-      JS_LineNumberToPC (js_context, script, line);
-
-  /* We need debug mode for now */
-  gjs_debug_interrupt_register_lock_debug_mode (debug_register);
+  /* We always have a user callback even if we couldn't successfully create a native
+   * breakpoint as we can always fall back to creating a pending one */
   GjsDebugUserCallback *user_callback = gjs_debug_user_callback_new (G_CALLBACK (callback),
                                                                      user_data);
-  GjsBreakpoint *breakpoint = gjs_breakpoint_new (script, pc);
-
-  g_hash_table_insert (debug_register->priv->breakpoints,
-                       breakpoint,
-                       user_callback);
-
   GjsDebugConnection *connection =
       gjs_debug_connection_new (gjs_debug_interrupt_register_remove_breakpoint,
                                 debug_register);
 
+  /* Try to create a native breakpoint. If it succeeds, add it to the breakpoints
+   * table, otherwise create a pending breakpoint */
+  GjsBreakpoint *breakpoint = lookup_line_and_create_native_breakpoint (js_context,
+                                                                        debug_register,
+                                                                        filename,
+                                                                        line,
+                                                                        user_callback);
+
+  if (breakpoint)
+    {
+      g_hash_table_insert (debug_register->priv->breakpoints,
+                           user_callback,
+                           breakpoint);
+    }
+  else
+    {
+      GjsPendingBreakpoint *pending = gjs_pending_breakpoint_new (filename, line);
+      g_hash_table_insert (debug_register->priv->pending_breakpoints,
+                           user_callback,
+                           pending);
+
+      /* We'll need to know about new scripts being loaded too */
+      gjs_debug_interrupt_register_lock_new_script_callback (debug_register);
+    }
+
   g_hash_table_insert (debug_register->priv->breakpoints_connections,
                        connection,
-                       breakpoint);
+                       user_callback);
 
-  /* Set the breakpoint on the JS side now that we're tracking it */
-  JS_SetTrap (js_context,
-              script,
-              pc,
-              gjs_debug_interrupt_register_trap_handler,
-              PRIVATE_TO_JSVAL (user_callback));
+  /* We need debug mode for now */
+  gjs_debug_interrupt_register_lock_debug_mode (debug_register);
 
   return connection;
 }
@@ -1052,7 +1265,7 @@ gjs_debug_interrupt_register_remove_connection_to_function_calls_and_execution (
                         reg->priv->call_and_execute_connections,
                         reg->priv->call_and_execute_hooks);
   gjs_debug_interrupt_register_unlock_debug_mode (reg);
-  gjs_debug_interrupt_register_unlock_function_calls_and_exectuion (reg);
+  gjs_debug_interrupt_register_unlock_function_calls_and_execution (reg);
 }
 
 static GjsDebugConnection *
@@ -1062,7 +1275,7 @@ gjs_debug_interrupt_register_connect_to_function_calls_and_execution (GjsInterru
 {
   GjsDebugInterruptRegister *debug_register = GJS_DEBUG_INTERRUPT_REGISTER (reg);
   gjs_debug_interrupt_register_lock_debug_mode (debug_register);
-  gjs_debug_interrupt_register_unlock_function_calls_and_exectuion (debug_register);
+  gjs_debug_interrupt_register_lock_function_calls_and_execution (debug_register);
   return insert_hook_callback (debug_register->priv->call_and_execute_hooks,
                                debug_register->priv->call_and_execute_connections,
                                G_CALLBACK (callback),
@@ -1095,6 +1308,7 @@ gjs_debug_interrupt_register_init (GjsDebugInterruptRegister *reg)
   reg->priv->single_step_connections = g_hash_table_new (g_direct_hash, g_direct_equal);
 
   reg->priv->breakpoints = g_hash_table_new (g_direct_hash, g_direct_equal);
+  reg->priv->pending_breakpoints = g_hash_table_new (g_direct_hash, g_direct_equal);
   reg->priv->single_step_hooks = g_array_new (TRUE, TRUE, sizeof (GjsDebugUserCallback));
   reg->priv->call_and_execute_hooks = g_array_new (TRUE, TRUE, sizeof (GjsDebugUserCallback));
   reg->priv->new_script_hooks = g_array_new (TRUE, TRUE, sizeof (GjsDebugUserCallback));
@@ -1145,10 +1359,11 @@ gjs_debug_interrupt_register_finalize (GObject *object)
     reg->priv->single_step_connections,
     reg->priv->call_and_execute_connections,
     reg->priv->breakpoints,
+    reg->priv->pending_breakpoints,
     NULL
   };
 
-  GArray *arrays_to_unref[] =
+  GArray *arrays_to_destroy[] =
   {
     reg->priv->new_script_hooks,
     reg->priv->call_and_execute_hooks,
@@ -1157,7 +1372,15 @@ gjs_debug_interrupt_register_finalize (GObject *object)
   };
 
   unref_all_hashtables (hashtables_to_unref);
-  destroy_all_arrays (arrays_to_unref);
+  destroy_all_arrays (arrays_to_destroy);
+
+  /* If we've still got locks on the context debug hooks then that's
+   * an error and we should assert here */
+  g_assert (reg->priv->call_and_execute_hook_lock_count == 0);
+  g_assert (reg->priv->debug_mode_lock_count == 0);
+  g_assert (reg->priv->interrupt_function_lock_count == 0);
+  g_assert (reg->priv->new_script_hook_lock_count == 0);
+  g_assert (reg->priv->single_step_mode_lock_count == 0);
 }
 
 static void

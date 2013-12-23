@@ -32,8 +32,7 @@ gjs_interrupt_register_add_breakpoint (GjsInterruptRegister *reg,
                                        const gchar          *filename,
                                        guint                line,
                                        GjsInterruptCallback callback,
-                                       gpointer             user_data,
-                                       GError               **error)
+                                       gpointer             user_data)
 {
   g_return_val_if_fail (reg, NULL);
   g_return_val_if_fail (filename, NULL);
@@ -43,8 +42,7 @@ gjs_interrupt_register_add_breakpoint (GjsInterruptRegister *reg,
                                                                     filename,
                                                                     line,
                                                                     callback,
-                                                                    user_data,
-                                                                    error);
+                                                                    user_data);
 }
 
 GjsDebugConnection *

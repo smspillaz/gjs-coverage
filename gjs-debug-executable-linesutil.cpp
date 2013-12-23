@@ -152,12 +152,15 @@ is_nonexecutable_line (const gchar *data,
                        guint       lineNumber)
 {
   const gchar *str = data;
-  guint lineNo = lineNumber;
-  while (--lineNumber)
+  if (lineNumber)
     {
-      str = strstr (str, "\n");
-      g_assert (str);
-      str += 1;
+      guint lineNo = lineNumber;
+      while (lineNo--)
+        {
+          str = strstr (str, "\n");
+          g_assert (str);
+          str += 1;
+        }
     }
 
   str = advance_past_leading_nonexecutable_characters (str);
@@ -296,12 +299,14 @@ gjs_context_get_executable_lines_for_file (GjsContext *context,
 
   g_assert (bytes_read == data_count);
 
+  gchar *path = g_file_get_path (file);
   guint *retval = gjs_context_get_executable_lines_for_string (context,
-                                                               g_file_get_path (file),
+                                                               path,
                                                                data,
                                                                begin_line,
                                                                n_executable_lines);
 
+  g_free (path);
   g_object_unref (stream);
 
   return retval;
@@ -323,4 +328,6 @@ gjs_context_get_executable_lines_for_filename (GjsContext  *context,
                                                              n_executable_lines);
 
   g_object_unref (file);
+
+  return retval;
 }

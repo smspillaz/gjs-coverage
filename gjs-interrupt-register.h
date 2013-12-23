@@ -70,8 +70,7 @@ struct _GjsInterruptRegisterInterface
                                             const gchar          *filename,
                                             guint                line,
                                             GjsInterruptCallback callback,
-                                            gpointer             user_data,
-                                            GError               **error);
+                                            gpointer             user_data);
     GjsDebugConnection * (*start_singlestep) (GjsInterruptRegister *reg,
                                               GjsInterruptCallback callback,
                                               gpointer             user_data);
