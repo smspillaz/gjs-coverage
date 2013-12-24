@@ -15,6 +15,8 @@ if (GJS_FOUND AND MOZJS_LIBRARY)
   add_library (gjsdebugger STATIC
                gjs-debug-connection.cpp
                gjs-debug-connection.h
+               gjs-debug-coverage.cpp
+               gjs-debug-coverage.h
                gjs-debug-interrupt-register.cpp
                gjs-debug-interrupt-register.h
                gjs-interrupt-register.cpp
@@ -41,6 +43,12 @@ if (GJS_FOUND AND MOZJS_LIBRARY)
                   test-gjs-debug-register.c)
 
   target_link_libraries (test-gjs-debug-register
+                         gjsdebugger)
+
+  add_executable (test-gjs-debug-coverage
+                  test-gjs-debug-coverage.c)
+
+  target_link_libraries (test-gjs-debug-coverage
                          gjsdebugger)
 
 endif (GJS_FOUND AND MOZJS_LIBRARY)

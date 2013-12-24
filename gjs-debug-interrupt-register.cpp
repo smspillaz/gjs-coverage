@@ -215,6 +215,28 @@ g_array_foreach (GArray   *array,
     (*func) (current_array_pointer, user_data);
 }
 
+static gchar *
+get_fully_qualified_path (const gchar *filename)
+{
+  gchar *fully_qualified_path = NULL;
+  /* Sometimes we might get just a basename if the script is in the current
+   * working directly. If that's the case, then we need to add the fully
+   * qualified pathname */
+  if (strstr (filename, "/") == NULL)
+    {
+      gchar *current_dir = g_get_current_dir ();
+      fully_qualified_path = g_strconcat (current_dir,
+                                          "/",
+                                          filename,
+                                          NULL);
+      g_free (current_dir);
+    }
+  else
+    fully_qualified_path = g_strdup (filename);
+
+  return fully_qualified_path;
+}
+
 static void
 gjs_debug_interrupt_register_populate_interrupt_info_from_js_function (GjsInterruptInfo *info,
                                                                        JSContext        *js_context,
@@ -226,7 +248,7 @@ gjs_debug_interrupt_register_populate_interrupt_info_from_js_function (GjsInterr
   if (js_function)
     js_function_name = JS_GetFunctionId (js_function);
 
-  info->filename = JS_GetScriptFilename (js_context, script);
+  info->filename = get_fully_qualified_path (JS_GetScriptFilename (js_context, script));
   info->line = JS_GetScriptBaseLineNumber (js_context, script);
 
   gchar *function_name = NULL;
@@ -257,6 +279,9 @@ gjs_debug_interrupt_register_clear_interrupt_info_dynamic (GjsInterruptInfo *inf
 {
   if (info->functionName)
     g_free ((gchar *) info->functionName);
+
+  if (info->filename)
+    g_free ((gchar *) info->filename);
 }
 
 static void
@@ -529,6 +554,7 @@ gjs_debug_interrupt_register_new_script_callback (JSContext    *context,
   GjsDebugScriptLookupInfo *info =
       gjs_debug_script_lookup_info_new (filename, lineno);
   JSContext *js_context = (JSContext *) gjs_context_get_native_context (reg->priv->context);
+  gchar *fully_qualified_path = get_fully_qualified_path (filename);
 
   g_hash_table_insert (reg->priv->scripts_loaded,
                        info,
@@ -546,7 +572,7 @@ gjs_debug_interrupt_register_new_script_callback (JSContext    *context,
     reg,
     js_context,
     script,
-    filename,
+    fully_qualified_path,
     lineno,
     reg->priv->breakpoints,
     NULL
@@ -562,7 +588,7 @@ gjs_debug_interrupt_register_new_script_callback (JSContext    *context,
   gjs_debug_interrupt_register_populate_script_info (&debug_script_info,
                                                      context,
                                                      script,
-                                                     filename,
+                                                     fully_qualified_path,
                                                      lineno);
 
 
@@ -578,6 +604,7 @@ gjs_debug_interrupt_register_new_script_callback (JSContext    *context,
                    &data);
 
   gjs_debug_interrupt_register_clear_script_info_dynamic (&debug_script_info);
+  g_free (fully_qualified_path);
 }
 
 static void
@@ -1206,9 +1233,9 @@ gjs_debug_interrupt_register_remove_singlestep (GjsDebugConnection *connection,
                         reg->priv->single_step_connections,
                         reg->priv->single_step_hooks);
 
-  gjs_debug_interrupt_register_unlock_debug_mode (reg);
   gjs_debug_interrupt_register_unlock_interrupt_function (reg);
   gjs_debug_interrupt_register_unlock_single_step_mode (reg);
+  gjs_debug_interrupt_register_unlock_debug_mode (reg);
 }
 
 static GjsDebugConnection *
@@ -1236,8 +1263,8 @@ gjs_debug_interrupt_register_remove_connection_to_script_load (GjsDebugConnectio
   remove_hook_callback (connection,
                         reg->priv->new_script_connections,
                         reg->priv->new_script_hooks);
-  gjs_debug_interrupt_register_unlock_debug_mode (reg);
   gjs_debug_interrupt_register_unlock_new_script_callback (reg);
+  gjs_debug_interrupt_register_unlock_debug_mode (reg);
 }
 
 static GjsDebugConnection *
@@ -1264,8 +1291,8 @@ gjs_debug_interrupt_register_remove_connection_to_function_calls_and_execution (
   remove_hook_callback (connection,
                         reg->priv->call_and_execute_connections,
                         reg->priv->call_and_execute_hooks);
-  gjs_debug_interrupt_register_unlock_debug_mode (reg);
   gjs_debug_interrupt_register_unlock_function_calls_and_execution (reg);
+  gjs_debug_interrupt_register_unlock_debug_mode (reg);
 }
 
 static GjsDebugConnection *
@@ -1351,6 +1378,10 @@ static void
 gjs_debug_interrupt_register_finalize (GObject *object)
 {
   GjsDebugInterruptRegister *reg = GJS_DEBUG_INTERRUPT_REGISTER (object);
+
+  /* Unref scripts_loaded here as there's no guaruntee it will be empty
+   * since the garbage-collect phase might happen after we're unreffed */
+  g_hash_table_unref (reg->priv->scripts_loaded);
 
   GHashTable *hashtables_to_unref[] =
   {

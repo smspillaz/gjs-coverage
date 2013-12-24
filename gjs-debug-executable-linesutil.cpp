@@ -88,9 +88,7 @@ static gboolean
 is_only_newline (const gchar *str)
 {
   if (str[0] == '\n')
-    {
       return TRUE;
-    }
 
   return FALSE;
 }
@@ -155,7 +153,11 @@ is_nonexecutable_line (const gchar *data,
   if (lineNumber)
     {
       guint lineNo = lineNumber;
-      while (lineNo--)
+
+      /* The lines provided to us by JS_GetLinePCs are always going to
+       * be 1-indexed and not 0-indexed, so we should only advance for
+       * n - 1 lines */
+      while (--lineNo)
         {
           str = strstr (str, "\n");
           g_assert (str);
@@ -165,7 +167,9 @@ is_nonexecutable_line (const gchar *data,
 
   str = advance_past_leading_nonexecutable_characters (str);
 
-  return is_only_newline (str) ||
+  /* Line zero is not executable */
+  return lineNumber == 0 ||
+         is_only_newline (str) ||
          is_single_line_comment (str) ||
          is_within_comment_block (str, data);
 }

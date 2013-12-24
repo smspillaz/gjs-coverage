@@ -59,8 +59,8 @@ gjs_debug_interrupt_register_fixture_tear_down (gpointer      fixture_data,
                                                 gconstpointer user_data)
 {
   GjsDebugInterruptRegisterFixture *fixture = fixture_data;
+  g_unlink (fixture->temporary_js_script_filename);
   g_free (fixture->temporary_js_script_filename);
-  g_unlink (fixture->temporary_js_script_open_handle);
   close (fixture->temporary_js_script_open_handle);
 
   g_object_unref (fixture->interrupt_register);
@@ -187,7 +187,7 @@ single_step_mock_interrupt_callback_tracking_lines (GjsInterruptRegister *reg,
                                                     gpointer             user_data)
 {
   GArray *line_tracker = (GArray *) user_data;
-  guint adjusted_line = info->line - 1;
+  guint adjusted_line = info->line;
 
   if (!guint_in_guint_array ((guint *) line_tracker->data,
                              line_tracker->len,
@@ -205,8 +205,10 @@ known_executable_lines_are_subset_of_executed_lines (const GArray *executed_line
     {
       gboolean found_executable_line_in_executed_lines = FALSE;
       for (j = 0; j < executed_lines->len; ++j)
-        if (g_array_index (executed_lines, guint, j) == executable_lines[i])
-          found_executable_line_in_executed_lines = TRUE;
+        {
+          if (g_array_index (executed_lines, guint, j) == executable_lines[i])
+            found_executable_line_in_executed_lines = TRUE;
+        }
 
       if (!found_executable_line_in_executed_lines)
         return FALSE;
